@@ -61,7 +61,13 @@ class LanguageFamily(Enum):
     HORN = "Horn"              # ≤1 positive literal
     ANTI_HORN = "AntiHorn"     # ≤1 negative literal
     AFFINE = "Affine"          # XOR constraint x₁⊕x₂⊕…=c
+    SQUARE_2CNF = "Square2CNF"  # Bijunctive (2-CNF)
     ANY = "Any"                # Root: all families compete
+
+
+class CompareOp(Enum):
+    LE = "LE"
+    GT = "GT"
 
 
 class GSNHPatternType(Enum):
@@ -167,6 +173,71 @@ class GSNHBinaryLiteral:
 
     def __repr__(self) -> str:
         return self.__str__()
+
+
+@dataclass(frozen=True)
+class CompareLiteral:
+    """Binary comparison literal for journal examples: x[i] ≤ x[j] or x[i] > x[j]."""
+    feature_i: int
+    feature_j: int
+    op: CompareOp
+
+    def is_positive(self) -> bool:
+        return self.op == CompareOp.GT
+
+    def evaluate(self, X: np.ndarray) -> np.ndarray:
+        if self.op == CompareOp.LE:
+            return X[:, self.feature_i] <= X[:, self.feature_j]
+        return X[:, self.feature_i] > X[:, self.feature_j]
+
+    def negate(self) -> 'CompareLiteral':
+        return CompareLiteral(
+            self.feature_i,
+            self.feature_j,
+            CompareOp.GT if self.op == CompareOp.LE else CompareOp.LE,
+        )
+
+    def __str__(self) -> str:
+        op = "≤" if self.op == CompareOp.LE else ">"
+        return f"(x[{self.feature_i}] {op} x[{self.feature_j}])"
+
+
+def select_language_for_dataset(X, y, candidate_langs, metric_weights, cv=3, sample_cap=4000):
+    """Select one fixed language family to be used for the entire tree."""
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.int32)
+    if len(X) > sample_cap:
+        idx = np.random.RandomState(42).choice(len(X), size=sample_cap, replace=False)
+        X = X[idx]
+        y = y[idx]
+
+    cv = max(2, int(cv))
+    folds = np.array_split(np.random.RandomState(42).permutation(len(X)), cv)
+    w_acc = float(metric_weights.get('accuracy', 1.0))
+    w_nodes = float(metric_weights.get('nodes', 0.0))
+    best_lang = None
+    best_score = -np.inf
+
+    for lang in candidate_langs:
+        fold_scores = []
+        for i in range(cv):
+            test_idx = folds[i]
+            train_idx = np.concatenate([folds[j] for j in range(cv) if j != i])
+            tree = ExpertGSNHTree(
+                stopping_criteria=StoppingCriteria(max_depth=6, min_samples_leaf=3),
+                n_bins=32,
+                mode='journal',
+                language=lang,
+            )
+            tree.fit(X[train_idx], y[train_idx])
+            acc = tree.score(X[test_idx], y[test_idx])
+            fold_scores.append(w_acc * acc - w_nodes * tree.n_nodes_)
+        score = float(np.mean(fold_scores))
+        if score > best_score:
+            best_score = score
+            best_lang = lang
+
+    return best_lang
 
 
 @dataclass
@@ -1491,7 +1562,8 @@ class ExpertGSNHTree:
                  language: LanguageFamily = LanguageFamily.ANY,
                  limit_2d: Optional[int] = None,
                  limit_3d: Optional[int] = None,
-                 use_binary_comparisons: bool = False):
+                 use_binary_comparisons: bool = False,
+                 enable_compare_literals: bool = False):
 
         self.stopping = stopping_criteria or StoppingCriteria()
         self.n_bins = n_bins
@@ -1514,6 +1586,7 @@ class ExpertGSNHTree:
         self.limit_2d = limit_2d
         self.limit_3d = limit_3d
         self.use_binary_comparisons = use_binary_comparisons
+        self.enable_compare_literals = enable_compare_literals
 
         self.root_ = None
         self.binner_ = None
@@ -1563,10 +1636,18 @@ class ExpertGSNHTree:
         # Build tree (if journal mode, strictly use the provided non-ANY language)
         self.language_counts_ = {}  # Track language family usage
         if self.mode == 'journal' and self.language == LanguageFamily.ANY:
-            self.language = LanguageFamily.HORN
+            self.language = select_language_for_dataset(
+                X, y,
+                candidate_langs=[LanguageFamily.HORN, LanguageFamily.ANTI_HORN, LanguageFamily.AFFINE],
+                metric_weights={'accuracy': 1.0, 'nodes': 0.0},
+                cv=3,
+                sample_cap=4000,
+            )
             if self.verbose:
-                print("mode='journal' but language='ANY'. Defaulting to HORN.")
-        
+                print(f"mode='journal' and language='ANY'. Auto-selected fixed language={self.language.value}.")
+        if self.mode == 'journal':
+            self._assert_journal_binary_dataset(X)
+
         start_language = self.language
         
         self.root_ = self._build_tree(
@@ -1808,7 +1889,7 @@ class ExpertGSNHTree:
     # ── Main search (FIX #2: importance only for winner) ────────────
 
     def _search_best_split(self, X, y, feature_scores,
-                            language=LanguageFamily.ANY, bounds=None):
+                            language=LanguageFamily.HORN, bounds=None):
         """Language-aware split search.
         
         When language=ANY: all families (Horn, Anti-Horn, Affine) compete.
@@ -1888,8 +1969,8 @@ class ExpertGSNHTree:
         n_samples = len(y)
 
         # Determine which families to search
-        search_horn = language in (LanguageFamily.ANY, LanguageFamily.HORN)
-        search_antihorn = language in (LanguageFamily.ANY, LanguageFamily.ANTI_HORN)
+        search_horn = language in (LanguageFamily.ANY, LanguageFamily.HORN, LanguageFamily.SQUARE_2CNF)
+        search_antihorn = language in (LanguageFamily.ANY, LanguageFamily.ANTI_HORN, LanguageFamily.SQUARE_2CNF)
         search_affine = language in (LanguageFamily.ANY, LanguageFamily.AFFINE)
 
         # ──── 1D (same for Horn and Anti-Horn) ────
@@ -1970,7 +2051,11 @@ class ExpertGSNHTree:
                                 gain = penalized_gain(gain, arity=2, n_bins=2, n_samples=n_total, n_classes=self.n_classes_)
                                 
                             if gain > best_gain and gain > 0:
-                                lit = GSNHBinaryLiteral(fi, fj, pol)
+                                if self.enable_compare_literals:
+                                    op = CompareOp.GT if pol == LiteralPolarity.GE else CompareOp.LE
+                                    lit = CompareLiteral(fi, fj, op)
+                                else:
+                                    lit = GSNHBinaryLiteral(fi, fj, pol)
                                 lang = lang_cand if language == LanguageFamily.ANY else language
                                 pred = GSNHPredicate((lit,), gain, lang)
                                 best_gain = gain
@@ -2086,6 +2171,7 @@ class ExpertGSNHTree:
 
         # ──── 3D Unified Search (Horn + Anti-Horn + Affine) — FAST Perfect XOR ────
         if (self.search_3d and self.n_features_ >= 3 and len(top_feats) >= 3
+                and language != LanguageFamily.SQUARE_2CNF
                 and (search_horn or search_antihorn or search_affine)):
 
             if self.limit_3d is not None:
@@ -2305,11 +2391,7 @@ class ExpertGSNHTree:
                   f"{best_pred} (gain={best_gain:.4f}, "
                   f"n={n}, left={left_n}, right={right_n})")
 
-        # ★ STAR-NESTING RULE:
-        #   True-branch (clause satisfied): child can use ANY language
-        #   False-branch (clause negated): child must use same language
-        #   (because negation of L stays in L for all 4 families)
-        #
+        # Journal mode keeps one fixed language for the full tree.
         # Fix #4: Propagate path bounding box.
         #   - TRUE branch (disjunction satisfied): at least one literal true,
         #     bounds are weaker → pass parent bounds unchanged.
@@ -2322,6 +2404,8 @@ class ExpertGSNHTree:
         bounds_right = dict(bounds)  # start from parent bounds
         if not best_pred.is_xor:  # XOR predicates don't give simple conjunctive bounds
             for lit in best_pred.literals:
+                if not hasattr(lit, "feature") or not hasattr(lit, "polarity") or not hasattr(lit, "threshold"):
+                    continue
                 f = lit.feature
                 lo_b, hi_b = bounds_right.get(f, (-np.inf, np.inf))
                 if lit.polarity == LiteralPolarity.GE:
@@ -2355,6 +2439,126 @@ class ExpertGSNHTree:
     def predict(self, X: np.ndarray) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
+    def _assert_journal_binary_dataset(self, X: np.ndarray):
+        vals = np.unique(X)
+        if not np.all(np.isin(vals, [0.0, 1.0])):
+            raise ValueError(
+                "journal mode requires binary features (0/1) for exact wAXp SAT semantics; "
+                f"found values like {vals[:10]}"
+            )
+
+    def _journal_literal_to_bool(self, lit):
+        if isinstance(lit, CompareLiteral):
+            raise ValueError("CompareLiteral is not supported in journal-mode SAT encoding.")
+        if not isinstance(lit, GSNHLiteral):
+            raise ValueError(f"Unsupported literal type in SAT encoding: {type(lit)}")
+        if abs(lit.threshold - 0.5) > 1e-8:
+            raise ValueError(
+                f"journal mode expects threshold 0.5 for boolean literals; got {lit.threshold}"
+            )
+        return lit.feature, (lit.polarity == LiteralPolarity.GE)
+
+    def _journal_build_cnf_xor(self, path_edges, x, S):
+        clauses = []
+        for f in S:
+            clauses.append([(f, bool(x[f] >= 0.5))])
+
+        for pred, branch in path_edges:
+            if pred.is_xor:
+                continue
+            if branch:
+                clauses.append([self._journal_literal_to_bool(lit) for lit in pred.literals])
+            else:
+                for lit in pred.literals:
+                    v, is_pos = self._journal_literal_to_bool(lit)
+                    clauses.append([(v, not is_pos)])
+        return clauses, None
+
+    def _horn_sat(self, clauses):
+        pos_head = []
+        body = []
+        for cl in clauses:
+            pos = [v for v, sign in cl if sign]
+            neg = [v for v, sign in cl if not sign]
+            if len(pos) > 1:
+                raise ValueError("Non-Horn clause provided to Horn SAT solver.")
+            pos_head.append(pos[0] if pos else None)
+            body.append(set(neg))
+
+        true_vars = set()
+        changed = True
+        while changed:
+            changed = False
+            for i, b in enumerate(body):
+                if b.issubset(true_vars):
+                    h = pos_head[i]
+                    if h is None:
+                        return False
+                    if h not in true_vars:
+                        true_vars.add(h)
+                        changed = True
+        return True
+
+    def _antihorn_sat(self, clauses):
+        flipped = [[(v, not sign) for v, sign in cl] for cl in clauses]
+        return self._horn_sat(flipped)
+
+    def _two_sat(self, clauses):
+        vars_set = set(v for cl in clauses for v, _ in cl)
+        idx = {v: i for i, v in enumerate(sorted(vars_set))}
+        n = len(idx)
+        g = [[] for _ in range(2 * n)]
+        gr = [[] for _ in range(2 * n)]
+
+        def lit_id(v, sign):
+            i = idx[v]
+            return 2 * i + (1 if sign else 0)
+
+        def add_imp(a, b):
+            g[a].append(b)
+            gr[b].append(a)
+
+        for cl in clauses:
+            if len(cl) == 1:
+                v, s = cl[0]
+                add_imp(lit_id(v, not s), lit_id(v, s))
+            elif len(cl) == 2:
+                (v1, s1), (v2, s2) = cl
+                add_imp(lit_id(v1, not s1), lit_id(v2, s2))
+                add_imp(lit_id(v2, not s2), lit_id(v1, s1))
+            else:
+                raise ValueError("2-SAT solver received non-bijunctive clause.")
+
+        order = []
+        seen = [False] * (2 * n)
+        def dfs(u):
+            seen[u] = True
+            for w in g[u]:
+                if not seen[w]:
+                    dfs(w)
+            order.append(u)
+        for i in range(2 * n):
+            if not seen[i]:
+                dfs(i)
+
+        comp = [-1] * (2 * n)
+        def rdfs(u, c):
+            comp[u] = c
+            for w in gr[u]:
+                if comp[w] == -1:
+                    rdfs(w, c)
+
+        c = 0
+        for u in reversed(order):
+            if comp[u] == -1:
+                rdfs(u, c)
+                c += 1
+
+        for _, i in idx.items():
+            if comp[2 * i] == comp[2 * i + 1]:
+                return False
+        return True
+
     def weak_axp_check(self, x: np.ndarray, y: int, S: set) -> bool:
         """Check if partial instance x_S guarantees prediction y using CSP."""
         paths = []
@@ -2379,26 +2583,25 @@ class ExpertGSNHTree:
 
     def _is_sat_path(self, path_edges, x, S):
         if self.mode != 'journal':
-            # Heuristic mode: use standard bounds propagation
             return self._bounds_propagation(path_edges, x, S)
 
-        # Journal mode: Exact satisfiability decision procedures per language
         precheck = self._bounds_propagation(path_edges, x, S)
         if precheck is False:
             return False
 
-        if self.language in (LanguageFamily.HORN, LanguageFamily.ANTI_HORN):
-            # For MDTs with contiguous domains, bounds propagation is isomorphic
-            # to unit resolution and is thus complete for Horn / AntiHorn.
-            # If bounds propagation halts without finding a contradiction, it's SAT.
-            return True
-        elif self.language == LanguageFamily.AFFINE:
+        clauses, _ = self._journal_build_cnf_xor(path_edges, x, S)
+        if self.language == LanguageFamily.HORN:
+            return self._horn_sat(clauses)
+        if self.language == LanguageFamily.ANTI_HORN:
+            return self._antihorn_sat(clauses)
+        if self.language == LanguageFamily.SQUARE_2CNF:
+            return self._two_sat(clauses)
+        if self.language == LanguageFamily.AFFINE:
             return self._exact_affine_sat(path_edges, x, S)
-        
-        return True
+        raise ValueError(f"Unsupported journal language for SAT: {self.language}")
 
     def _bounds_propagation(self, path_edges, x, S):
-        """Fast bounds propagation acting as an exact solver for Horn/AntiHorn and a precheck for Affine."""
+        """Fast bounds propagation pre-check; returns None when constraints are non-interval."""
         bounds_lo = {}
         bounds_hi = {}
         or_clauses = []
@@ -2414,6 +2617,8 @@ class ExpertGSNHTree:
                 or_clauses.append(pred.literals)
             else:
                 for lit in pred.literals:
+                    if not hasattr(lit, "polarity") or not hasattr(lit, "threshold"):
+                        return None
                     pol = LiteralPolarity.LT if lit.polarity == LiteralPolarity.GE else LiteralPolarity.GE
                     f = lit.feature
                     if pol == LiteralPolarity.GE:
@@ -2437,6 +2642,8 @@ class ExpertGSNHTree:
                 is_true = False
                 unknown_lits = []
                 for lit in lits:
+                    if not hasattr(lit, "feature") or not hasattr(lit, "polarity") or not hasattr(lit, "threshold"):
+                        return None
                     f = lit.feature
                     if f in S:
                         val = x[f]
@@ -2484,7 +2691,7 @@ class ExpertGSNHTree:
         """Exact Gaussian elimination mod 2 for Affine XOR rules over boolean domains."""
         equations = []
         for f in S:
-            val = 1 if x[f] > 0 else 0
+            val = 1 if x[f] >= 0.5 else 0
             equations.append(({f: 1}, val))
             
         for pred, branch in path_edges:
@@ -3657,6 +3864,86 @@ def run_benchmark():
     print("=" * 60)
 
     return results
+
+
+def _bruteforce_sat_path(path_edges, x, S, n_features):
+    free = [i for i in range(n_features) if i not in S]
+    for mask in range(1 << len(free)):
+        a = np.array(x, dtype=np.float64).copy()
+        for j, f in enumerate(free):
+            a[f] = 1.0 if ((mask >> j) & 1) else 0.0
+        ok = True
+        for pred, branch in path_edges:
+            val = pred.evaluate(a.reshape(1, -1))[0]
+            if bool(val) != bool(branch):
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def verify_journal_sat_solvers_random(n_tests_per_lang=200, n_features=8, seed=0):
+    rng = np.random.RandomState(seed)
+    langs = [LanguageFamily.HORN, LanguageFamily.ANTI_HORN, LanguageFamily.AFFINE]
+
+    for lang in langs:
+        tree = ExpertGSNHTree(mode='journal', language=lang)
+        tree.n_features_ = n_features
+        for _ in range(n_tests_per_lang):
+            x = rng.randint(0, 2, size=n_features).astype(np.float64)
+            S = set(np.where(rng.rand(n_features) < 0.5)[0])
+            n_edges = rng.randint(1, 5)
+            path_edges = []
+            for _e in range(n_edges):
+                arity = rng.randint(1, 4)
+                feats = rng.choice(n_features, size=arity, replace=False)
+                if lang == LanguageFamily.HORN:
+                    pos_idx = rng.randint(-1, arity)
+                    lits = []
+                    for i, f in enumerate(feats):
+                        pol = LiteralPolarity.GE if i == pos_idx else LiteralPolarity.LT
+                        lits.append(GSNHLiteral(int(f), 0.5, pol))
+                    pred = GSNHPredicate(tuple(lits), language_family=lang)
+                elif lang == LanguageFamily.ANTI_HORN:
+                    neg_idx = rng.randint(-1, arity)
+                    lits = []
+                    for i, f in enumerate(feats):
+                        pol = LiteralPolarity.LT if i == neg_idx else LiteralPolarity.GE
+                        lits.append(GSNHLiteral(int(f), 0.5, pol))
+                    pred = GSNHPredicate(tuple(lits), language_family=lang)
+                else:
+                    lits = []
+                    for f in feats:
+                        pol = LiteralPolarity.GE if rng.rand() < 0.5 else LiteralPolarity.LT
+                        lits.append(GSNHLiteral(int(f), 0.5, pol))
+                    pred = GSNHPredicate(tuple(lits), language_family=lang, is_xor=True)
+                branch = bool(rng.rand() < 0.5)
+                path_edges.append((pred, branch))
+
+            sat_solver = tree._is_sat_path(path_edges, x, S)
+            sat_brute = _bruteforce_sat_path(path_edges, x, S, n_features)
+            if sat_solver != sat_brute:
+                raise AssertionError(
+                    f"SAT mismatch for {lang.value}: solver={sat_solver} brute={sat_brute}"
+                )
+
+
+def quick_journal_self_test():
+    verify_gsnh_constraints()
+    verify_journal_sat_solvers_random(n_tests_per_lang=200, n_features=8, seed=7)
+
+    rng = np.random.RandomState(1)
+    X = rng.randint(0, 2, size=(200, 6)).astype(np.float64)
+    y = (X[:, 0].astype(np.int32) ^ X[:, 1].astype(np.int32)).astype(np.int32)
+    tr = ExpertGSNHTree(
+        stopping_criteria=StoppingCriteria(max_depth=4, min_samples_leaf=5),
+        n_bins=8,
+        mode='journal',
+        language=LanguageFamily.ANY,
+    )
+    tr.fit(X, y)
+    _ = tr.score(X, y)
 
 
 # =============================================================================
